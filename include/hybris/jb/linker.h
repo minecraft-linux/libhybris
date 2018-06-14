@@ -31,7 +31,12 @@
 
 #include <unistd.h>
 #include <sys/types.h>
+
+#ifdef __APPLE__
+#include "_elf.h"
+#else
 #include <elf.h>
+#endif
 
 #undef PAGE_MASK
 #undef PAGE_SIZE
