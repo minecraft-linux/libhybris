@@ -18,7 +18,7 @@ target_compile_definitions(hybris PRIVATE ANDROID_X86_LINKER _GNU_SOURCE LINKER_
 target_link_libraries(hybris Threads::Threads)
 
 if(APPLE)
-    target_link_libraries(hybris epoll osx-elf-header)
+    target_link_libraries(hybris epoll-shim osx-elf-header)
 else()
     target_link_libraries(hybris rt)
 endif()
