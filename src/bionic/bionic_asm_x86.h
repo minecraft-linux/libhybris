@@ -41,7 +41,7 @@
 	call	666f;	\
 666:			\
 	popl	%ebx;	\
-	addl	$_GLOBAL_OFFSET_TABLE_+[.-666b], %ebx
+	// addl	$_GLOBAL_OFFSET_TABLE_+(.-666b), %ebx - HACK: currently unused, so we delete it as it causes issues on OS X
 #define PIC_EPILOGUE	\
 	popl	%ebx
 #define PIC_PLT(x)	x@PLT

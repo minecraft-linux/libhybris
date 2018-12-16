@@ -98,9 +98,11 @@ __BIONIC_WEAK_ASM_FOR_NATIVE_BRIDGE(bionic_sigsetjmp)
 
 .L_sigsetjmp:
   PIC_PROLOGUE
+  pushl %ecx
   pushl %eax
-  call PIC_PLT(__bionic_setjmp_cookie_get)
+  call PIC_PLT(CDECL(__bionic_setjmp_cookie_get))
   addl $4,%esp
+  popl %ecx
   PIC_EPILOGUE
 
   // Record the setjmp cookie and whether or not we're saving the signal mask.
@@ -114,11 +116,13 @@ __BIONIC_WEAK_ASM_FOR_NATIVE_BRIDGE(bionic_sigsetjmp)
   pushl %ecx
   PIC_PROLOGUE
   leal (_JB_SIGMASK * 4)(%ecx),%eax
+  subl $8,%esp
   pushl %eax
   pushl $0 // NULL
   pushl $2 // SIG_SETMASK
-  call PIC_PLT(sigprocmask)
+  call PIC_PLT(CDECL(sigprocmask))
   addl $12,%esp
+  addl $8,%esp
   PIC_EPILOGUE
   popl %ecx
 
@@ -165,7 +169,7 @@ __BIONIC_WEAK_ASM_FOR_NATIVE_BRIDGE(bionic_siglongjmp)
   pushl $0 // NULL
   pushl %eax
   pushl $2 // SIG_SETMASK
-  call PIC_PLT(sigprocmask)
+  call PIC_PLT(CDECL(sigprocmask))
   addl $12,%esp
   PIC_EPILOGUE
 
@@ -193,7 +197,7 @@ __BIONIC_WEAK_ASM_FOR_NATIVE_BRIDGE(bionic_siglongjmp)
   pushl %eax
   pushl %ecx
   pushl (_JB_SIGFLAG * 4)(%edx)
-  call PIC_PLT(__bionic_setjmp_cookie_check)
+  call PIC_PLT(CDECL(__bionic_setjmp_cookie_check))
   addl $4,%esp
   popl %ecx
   popl %eax
@@ -209,7 +213,7 @@ __BIONIC_WEAK_ASM_FOR_NATIVE_BRIDGE(bionic_siglongjmp)
 3:
   PIC_PROLOGUE
   pushl (_JB_SIGMASK * 4)(%edx)
-  call PIC_PLT(__bionic_setjmp_checksum_mismatch)
+  call PIC_PLT(CDECL(__bionic_setjmp_checksum_mismatch))
 END(bionic_siglongjmp)
 
 ALIAS_SYMBOL(bionic_longjmp, bionic_siglongjmp)
