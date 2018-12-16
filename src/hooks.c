@@ -299,6 +299,10 @@ static void my_assert(const char* file, int line, const char* msg) {
     abort();
 }
 
+extern void bionic_setjmp();
+extern void bionic_longjmp();
+
+
 struct _hook main_hooks[] = {
     {"property_get", property_get },
     {"property_set", property_set },
@@ -327,8 +331,13 @@ struct _hook main_hooks[] = {
     {"utime", utime},
     {"setlocale", setlocale},
     {"localeconv", localeconv},
+#ifdef USE_BIONIC_SETJMP
+    {"setjmp", bionic_setjmp},
+    {"longjmp", bionic_longjmp},
+#else
     {"setjmp", _setjmp},
     {"longjmp", longjmp},
+#endif
     {"__umoddi3", __umoddi3},
     {"__udivdi3", __udivdi3},
     {"__divdi3", __divdi3},
