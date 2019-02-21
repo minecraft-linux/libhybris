@@ -33,7 +33,7 @@
 static long setjmp_cookie;
 
 void __bionic_init_setjmp_cookie() {
-    long value = 1337L;//arc4random();
+    long value = (long) arc4random();
     // Mask off the last bit to store the signal flag.
     setjmp_cookie = value & ~1;
 }
