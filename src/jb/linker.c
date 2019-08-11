@@ -131,6 +131,10 @@ unsigned bitmask[4096];
 #define PT_ARM_EXIDX    0x70000001      /* .ARM.exidx segment */
 #endif
 
+#ifndef __APPLE__
+extern size_t strlcpy(char *dst, const char *src, size_t siz);
+#endif
+
 #if 0
 // disable abort() since this is not a linker anymore
 #define HOODLUM(name, ret, ...)                                               \
