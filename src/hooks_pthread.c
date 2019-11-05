@@ -404,6 +404,27 @@ static int my_pthread_mutex_trylock(pthread_mutex_t *__mutex)
     return pthread_mutex_trylock(realmutex);
 }
 
+static int my_pthread_mutex_timedlock(pthread_mutex_t *__restrict __mutex,
+        const struct timespec *__restrict __abstime)
+{
+    unsigned int value = (*(unsigned int *) __mutex);
+
+    if (hybris_check_android_shared_mutex(value)) {
+        LOGD("Shared mutex with Android, not try locking.");
+        return 0;
+    }
+
+    pthread_mutex_t *realmutex = (pthread_mutex_t *) value;
+    if (hybris_is_pointer_in_shm((void*)value))
+        realmutex = (pthread_mutex_t *)hybris_get_shmpointer((hybris_shm_pointer_t)value);
+
+    if (value <= ANDROID_TOP_ADDR_VALUE_MUTEX) {
+        realmutex = my_static_init_mutex(__mutex);
+    }
+
+    return pthread_mutex_timedlock(realmutex, __abstime);
+}
+
 static int my_pthread_mutex_unlock(pthread_mutex_t *__mutex)
 {
     if (!__mutex) {
@@ -1057,8 +1078,8 @@ static int darwin_my_sem_post(struct darwin_my_sem_info **sem) {
 
 struct _hook pthread_hooks[] = {
     /* pthread.h */
-    // {"getauxval", getauxval},
     {"gettid", my_gettid},
+    {"pthread_gettid_np", my_gettid},
     {"pthread_atfork", pthread_atfork},
     {"pthread_create", my_pthread_create},
     {"pthread_kill", pthread_kill},
@@ -1079,6 +1100,7 @@ struct _hook pthread_hooks[] = {
     {"pthread_mutex_lock", my_pthread_mutex_lock},
     {"pthread_mutex_unlock", my_pthread_mutex_unlock},
     {"pthread_mutex_trylock", my_pthread_mutex_trylock},
+    {"pthread_mutex_timedlock", my_pthread_mutex_timedlock},
 #ifndef __APPLE__
     {"pthread_mutex_lock_timeout_np", my_pthread_mutex_lock_timeout_np},
 #endif
@@ -1112,7 +1134,6 @@ struct _hook pthread_hooks[] = {
 #ifndef __APPLE__
     {"pthread_cond_timedwait_relative_np", my_pthread_cond_timedwait_relative_np},
 #endif
-    {"pthread_key_delete", pthread_key_delete},
     {"pthread_setname_np", pthread_setname_np},
 #ifdef __APPLE__
     {"pthread_once", darwin_my_pthread_once},
@@ -1120,6 +1141,7 @@ struct _hook pthread_hooks[] = {
     {"pthread_once", pthread_once},
 #endif
     {"pthread_key_create", pthread_key_create},
+    {"pthread_key_delete", pthread_key_delete},
     {"pthread_setspecific", pthread_setspecific},
     {"pthread_getspecific", pthread_getspecific},
     {"pthread_attr_init", my_pthread_attr_init},

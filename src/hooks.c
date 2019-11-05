@@ -43,6 +43,8 @@
 #include <stdarg.h>
 #include <semaphore.h>
 #include <sys/resource.h>
+#include <sys/sysinfo.h>
+#include <wait.h>
 
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -53,7 +55,6 @@
 #include <syslog.h>
 #include <locale.h>
 #ifndef __APPLE__
-#include <sys/syscall.h>
 #include <sys/auxv.h>
 #include <sys/prctl.h>
 #include <malloc.h>
@@ -75,6 +76,7 @@
 #include <wctype.h>
 #include <ctype.h>
 #include <setjmp.h>
+#include <bits/sigaction.h>
 
 #ifdef __APPLE__
 #include <xlocale.h>
@@ -82,97 +84,61 @@
 
 #include "../include/hybris/hook.h"
 #include "../include/hybris/properties.h"
-#include "ctype.h"
+#include "sigset.h"
 
 static locale_t hybris_locale;
 static int locale_inited = 0;
 
 /* Debug */
 #include "logging.h"
+
 #define LOGD(message, ...) HYBRIS_DEBUG_LOG(HOOKS, message, ##__VA_ARGS__)
 
-/* we have a value p:
- *  - if p <= ANDROID_TOP_ADDR_VALUE_MUTEX then it is an android mutex, not one we processed
- *  - if p > VMALLOC_END, then the pointer is not a result of malloc ==> it is an shm offset
- */
 
-uintptr_t _hybris_stack_chk_guard = 0;
-
-#ifndef __APPLE__
-static void __attribute__((constructor)) __init_stack_check_guard() {
-    _hybris_stack_chk_guard = *((uintptr_t*) getauxval(AT_RANDOM));
+#ifdef __APPLE__
+static char hybris_fake_at_random[16];
+static void __attribute__((constructor)) __init_fake_at_random() {
+    arc4random_buf(hybris_fake_at_random, 16);
 }
 #endif
 
-
-/*
- * utils, such as malloc, memcpy
- *
- * Useful to handle hacks such as the one applied for Nvidia, and to
- * avoid crashes.
- *
- * */
-
-static void *my_malloc(size_t size)
-{
-    return (char*)malloc(size);
-}
-
-static void *my_memcpy(void *dst, const void *src, size_t len)
-{
-    if (src == NULL || dst == NULL)
-        return NULL;
-
-    return memcpy(dst, src, len);
-}
-
-static size_t my_strlen(const char *s)
-{
-
-    if (s == NULL)
-        return -1;
-
-    return strlen(s);
-}
-
-size_t my_strlen_chk(const char *s, size_t s_len) {
-    size_t ret = strlen(s);
-    if (ret >= s_len) {
-        LOGD("__strlen_chk: ret >= s_len");
-        abort();
+unsigned long int my_getauxval(int what) {
+    switch (what) {
+        case 25: /* AT_RANDOM */
+#ifdef __APPLE__
+            return (unsigned long int) (void *) hybris_fake_at_random;
+#else
+            return getauxval(AT_RANDOM);
+#endif
+        case 6: /* AT_PAGESZ */
+            return getpagesize();
+        default:
+            printf("getauxval: unsupported value: %i\n", what);
+            abort();
     }
-    return ret;
 }
-
-#ifndef __APPLE__
-extern size_t strlcpy(char *dst, const char *src, size_t siz);
-#endif
 
 #ifdef __APPLE__
 
-int darwin_my_fdatasync(int fildes) {
-    return fcntl(fildes, F_FULLFSYNC);
-}
-
-// Android uses 32-bit offset while Mac OS uses 64-bit one
-
-ssize_t darwin_my_pread(int fd, void *buf, size_t count, long offset) {
-    return pread(fd, buf, count, offset);
-}
-
-ssize_t darwin_my_pwrite(int fd, const void *buf, size_t count, long offset) {
-    return pwrite(fd, buf, count, offset);
-}
-
-struct android_rlimit
-{
+struct android_rlimit {
     unsigned long int rlim_cur;
     unsigned long int rlim_max;
 };
+struct android_rlimit64 {
+    unsigned long long int rlim_cur;
+    unsigned long long int rlim_max;
+};
+
+static int _darwin_android_rlimit_to_host(int resource) {
+    if (resource == 7) return RLIMIT_NOFILE;
+    printf("unsupported rlimit resource: %i\n", resource);
+    return -1;
+}
 
 int darwin_my_getrlimit(int resource, struct android_rlimit *rlim) {
-    if (resource == 7)
-        resource = RLIMIT_NOFILE;
+    resource = _darwin_android_rlimit_to_host(resource);
+    if (resource < 0)
+        return resource;
     struct rlimit os_rlim;
     int ret = getrlimit(resource, &os_rlim);
     rlim->rlim_cur = (unsigned long int) os_rlim.rlim_cur;
@@ -180,19 +146,33 @@ int darwin_my_getrlimit(int resource, struct android_rlimit *rlim) {
     return ret;
 }
 
-int darwin_my_clock_gettime(clockid_t clk_id, struct timespec *tp) {
-    if (clk_id == 1)
-        clk_id = CLOCK_MONOTONIC;
-    return clock_gettime(clk_id, tp);
+int darwin_my_prlimit64(pid_t pid, int resource,
+        const struct android_rlimit64 *new_limit, struct android_rlimit64 *old_limit) {
+    resource = _darwin_android_rlimit_to_host(resource);
+    if (resource < 0)
+        return resource;
+    struct rlimit os_new_rlim, os_old_rlim;
+    os_new_rlim.rlim_cur = new_limit->rlim_cur;
+    os_new_rlim.rlim_max = new_limit->rlim_max;
+    int ret = prlimit(pid, resource, &os_new_rlim, &os_old_rlim);
+    if (old_limit) {
+        old_limit->rlim_cur = os_old_rlim.rlim_cur;
+        old_limit->rlim_max = os_old_rlim.rlim_max;
+    }
+    return ret;
 }
 
-int darwin_my_ioctl(int s, int cmd, void* arg) {
-    unsigned long mcmd = cmd;
-    if (cmd == 0x5421)
-        mcmd = FIONBIO;
-    else
-        printf("potentially unsupported ioctl: %x\n", cmd);
-    return ioctl(s, mcmd, arg);
+static void darwin_clock_id(clockid_t clk_id) {
+    if (clk_id == 1)
+        return CLOCK_MONOTONIC;
+    printf("unknown clockid: %i\n", clk_id);
+}
+
+int darwin_my_clock_getres(clockid_t clk_id, struct timespec *res) {
+    return clock_getres(darwin_clock_id(clk_id), res);
+}
+int darwin_my_clock_gettime(clockid_t clk_id, struct timespec *tp) {
+    return clock_gettime(darwin_clock_id(clk_id), tp);
 }
 
 int* darwin_my_errno() {
@@ -203,12 +183,6 @@ int* darwin_my_errno() {
     return ret;
 }
 
-void* darwin_my_memalign(size_t alignment, size_t size) {
-    void* ret;
-    if (posix_memalign(&ret, alignment, size) != 0)
-        return NULL;
-    return ret;
-}
 
 int darwin_my_prctl(int opt) {
     printf("unsupported prctl %i\n", opt);
@@ -226,59 +200,73 @@ static void* darwin_my_mmap(void *addr, size_t length, int prot, int flags,
         flags_m |= MAP_NORESERVE;
     return mmap(addr, length, prot, flags_m, fd, offset);
 }
+
 #endif
 
-static int my_set_errno(int oi_errno)
-{
-    errno = oi_errno;
-    return -1;
+static void my_sig_stub() {
+    printf("unsupported signal related function\n");
+    abort();
 }
 
-extern long my_sysconf(int name);
+struct bionic_sigaction {
+    void (*sa_handler_func)(int);
+    bionic_sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_restorer)(void);
+};
+struct bionic_sigaction64 {
+    void (*sa_handler_func)(int);
+    int sa_flags;
+    void (*sa_restorer)(void);
+    bionic_sigset64_t sa_mask;
+};
+static int my_sigaction(int signum, const struct bionic_sigaction *act,
+        struct bionic_sigaction *oldact) {
+    struct sigaction host_act, host_oldact;
+    host_act.sa_handler = act->sa_handler_func;
+    bionic_sigset_t_to_host(&host_act.sa_mask, &act->sa_mask);
+    host_act.sa_flags = act->sa_flags;
+    host_act.sa_restorer = act->sa_restorer;
+    int ret = sigaction(signum, &host_act, &host_oldact);
+    if (oldact) {
+        oldact->sa_handler_func = host_oldact.sa_handler;
+        bionic_sigset_t_from_host(&oldact->sa_mask, &host_oldact.sa_mask);
+        oldact->sa_flags = host_oldact.sa_flags;
+        oldact->sa_restorer = host_oldact.sa_restorer;
+    }
+    return ret;
+}
+static int my_sigaction64(int signum, const struct bionic_sigaction64 *act,
+        struct bionic_sigaction64 *oldact) {
+    struct sigaction host_act, host_oldact;
+    host_act.sa_handler = act->sa_handler_func;
+    bionic_sigset64_t_to_host(&host_act.sa_mask, &act->sa_mask);
+    host_act.sa_flags = act->sa_flags;
+    host_act.sa_restorer = act->sa_restorer;
+    int ret = sigaction(signum, &host_act, &host_oldact);
+    if (oldact) {
+        oldact->sa_handler_func = host_oldact.sa_handler;
+        bionic_sigset64_t_from_host(&oldact->sa_mask, &host_oldact.sa_mask);
+        oldact->sa_flags = host_oldact.sa_flags;
+        oldact->sa_restorer = host_oldact.sa_restorer;
+    }
+    return ret;
+}
 
-FP_ATTRIB static double my_strtod(const char *nptr, char **endptr)
-{
-	if (locale_inited == 0)
-	{
-		hybris_locale = newlocale(LC_ALL_MASK, "C", 0);
-		locale_inited = 1;
-	}
-	return strtod_l(nptr, endptr, hybris_locale);
+static int my_getcwd(char* buf, size_t size) {
+    char *ret = getcwd(buf, size);
+    if (ret != buf)
+        abort();
+    return (ret ? 0 : (-1));
+}
+
+static void my_syscall() {
+    printf("syscall is not supported\n");
+    abort();
 }
 
 extern int __cxa_atexit(void (*)(void*), void*, void*);
 extern void __cxa_finalize(void * d);
-
-
-/**
- * NOTE: Normally we don't have to wrap __system_property_get (libc.so) as it is only used
- * through the property_get (libcutils.so) function. However when property_get is used
- * internally in libcutils.so we don't have any chance to hook our replacement in.
- * Therefore we have to hook __system_property_get too and just replace it with the
- * implementation of our internal property handling
- */
-
-int my_system_property_get(const char *name, char *value)
-{
-	return property_get(name, value, NULL);
-}
-
-static __thread void *tls_hooks[16];
-
-void *__get_tls_hooks()
-{
-  return tls_hooks;
-}
-
-extern off_t __umoddi3(off_t a, off_t b);
-extern off_t __udivdi3(off_t a, off_t b);
-extern off_t __divdi3(off_t a, off_t b);
-
-void _hybris_stack_stack_chk_fail() {
-    printf("__stack_chk_fail\n");
-    abort();
-}
-
 
 void *get_hooked_symbol(const char *sym);
 void *my_android_dlsym(void *handle, const char *symbol)
@@ -290,312 +278,68 @@ void *my_android_dlsym(void *handle, const char *symbol)
     return android_dlsym(handle, symbol);
 }
 
-static void my_assert2(const char* file, int line, const char* function, const char* msg) {
-    fprintf(stderr, "%s:%u: %s: assertion \"%s\" failed", file, line, function, msg);
-    abort();
-}
-static void my_assert(const char* file, int line, const char* msg) {
-    fprintf(stderr, "%s:%u: assertion \"%s\" failed", file, line, msg);
-    abort();
-}
 extern void _Znwj();
 extern void _ZdlPv();
 
-extern void bionic_setjmp();
-extern void bionic_longjmp();
-
-
 struct _hook main_hooks[] = {
-    {"property_get", property_get },
-    {"property_set", property_set },
-    {"__system_property_get", my_system_property_get },
-    {"__stack_chk_fail", _hybris_stack_stack_chk_fail},
-    {"__stack_chk_guard", &_hybris_stack_chk_guard},
-    {"printf", printf },
-    {"malloc", my_malloc },
-    {"_ZdlPv", _ZdlPv },
-    {"_Znwj", _Znwj },
-    // {"pvalloc", pvalloc },
-    {"getxattr", getxattr},
-    {"__assert", my_assert },
-    {"__assert2", my_assert2 },
-    {"uname", uname },
-    {"sched_yield", sched_yield},
-    {"ldexp", ldexp},
-#ifdef __APPLE__
-    {"getrlimit", darwin_my_getrlimit},
-    {"ioctl", darwin_my_ioctl},
-    {"memalign", darwin_my_memalign},
-#else
-    {"getrlimit", getrlimit},
-    {"ioctl", ioctl},
-    {"memalign", memalign},
-#endif
-    {"gettimeofday", gettimeofday},
-    {"utime", utime},
-    {"setlocale", setlocale},
-    {"localeconv", localeconv},
-#ifdef USE_BIONIC_SETJMP
-    {"setjmp", bionic_setjmp},
-    {"longjmp", bionic_longjmp},
-#else
-    {"setjmp", _setjmp},
-    {"longjmp", longjmp},
-#endif
-    {"__umoddi3", __umoddi3},
-    {"__udivdi3", __udivdi3},
-    {"__divdi3", __divdi3},
-    /* stdlib.h */
-    // {"__ctype_get_mb_cur_max", __ctype_get_mb_cur_max},
-#ifndef AVOID_FLOAT_POINT_HOOKS
-    {"atof", atof},
-#endif
-    {"atoi", atoi},
-    {"atol", atol},
-    {"atoll", atoll},
-#ifndef AVOID_FLOAT_POINT_HOOKS
-    {"strtod", strtod},
-    {"strtof", strtof},
-    {"strtold", strtold},
-#endif
-    {"strtol", strtol},
-    {"strtoul", strtoul},
-    {"strtoq", strtoq},
-    {"strtouq", strtouq},
-    {"strtoll", strtoll},
-    {"strtoull", strtoull},
-    // {"strtol_l", strtol_l},
-    {"strtoul_l", strtoul_l},
-    // {"strtoll_l", strtoll_l},
-    // {"strtoull_l", strtoull_l},
-    // {"strtod_l", strtod_l},
-#ifndef AVOID_FLOAT_POINT_HOOKS
-    {"strtof_l", strtof_l},
-    {"strtold_l", strtold_l},
-#endif
-    // {"l64a", l64a},
-    // {"a64l", a64l},
-    {"random", random},
-    {"srandom", srandom},
-    {"initstate", initstate},
-    {"setstate", setstate},
-    // {"random_r", random_r},
-    // {"srandom_r", srandom_r},
-    // {"initstate_r", initstate_r},
-    // {"setstate_r", setstate_r},
-    {"rand", rand},
-    {"srand", srand},
-    {"rand_r", rand_r},
-    {"drand48", drand48},
-    {"erand48", erand48},
-    {"lrand48", lrand48},
-    {"nrand48", nrand48},
-    {"mrand48", mrand48},
-    {"jrand48", jrand48},
-    {"srand48", srand48},
-    {"seed48", seed48},
-    {"lcong48", lcong48},
-    // {"drand48_r", drand48_r},
-    // {"erand48_r", erand48_r},
-    // {"lrand48_r", lrand48_r},
-    // {"nrand48_r", nrand48_r},
-    // {"mrand48_r", mrand48_r},
-    // {"jrand48_r", jrand48_r},
-    // {"srand48_r", srand48_r},
-    // {"seed48_r", seed48_r},
-    // {"lcong48_r", lcong48_r},
-    {"calloc", calloc},
-    {"realloc", realloc},
-    {"free", free},
-    {"valloc", valloc},
-    {"posix_memalign", posix_memalign},
-    // {"aligned_alloc", aligned_alloc},
-    {"abort", abort},
-    {"atexit", atexit},
-    // {"on_exit", on_exit},
-    {"exit", exit},
-    // {"quick_exit", quick_exit},
-    {"_Exit", _Exit},
-    {"getenv", getenv},
-    // {"secure_getenv", secure_getenv},
-    {"putenv", putenv},
-    {"setenv", setenv},
-    {"unsetenv", unsetenv},
-    // {"clearenv", clearenv},
-    {"mkstemp", mkstemp},
-    // {"mkstemp64", mkstemp64},
-    // {"mkstemps", mkstemps},
-    // {"mkstemps64", mkstemps64},
-    {"mkdtemp", mkdtemp},
-    {"mkostemp", mkostemp},
-    // {"mkostemp64", mkostemp64},
-    // {"mkostemps", mkostemps},
-    // {"mkostemps64", mkostemps64},
-    {"system", system},
-    // {"canonicalize_file_name", canonicalize_file_name},
-    {"realpath", realpath},
-    {"bsearch", bsearch},
-    {"qsort", qsort},
-    {"qsort_r", qsort_r},
-    {"abs", abs},
-    {"labs", labs},
-    {"llabs", llabs},
-    {"div", div},
-    {"ldiv", ldiv},
-    {"lldiv", lldiv},
-#ifndef AVOID_FLOAT_POINT_HOOKS
-    {"ecvt", ecvt},
-    {"fcvt", fcvt},
-    {"gcvt", gcvt},
-#endif
-    // {"qecvt", qecvt},
-    // {"qfcvt", qfcvt},
-    // {"qgcvt", qgcvt},
-    // {"ecvt_r", ecvt_r},
-    // {"fcvt_r", fcvt_r},
-    // {"qecvt_r", qecvt_r},
-    // {"qfcvt_r", qfcvt_r},
-    {"mblen", mblen},
-    {"mbtowc", mbtowc},
-    {"wctomb", wctomb},
-    {"mbstowcs", mbstowcs},
-    {"wcstombs", wcstombs},
-    {"wcsrtombs", wcsrtombs},
-    // {"rpmatch", rpmatch},
-    {"getsubopt", getsubopt},
-    {"posix_openpt", posix_openpt},
-    {"grantpt", grantpt},
-    {"unlockpt", unlockpt},
-    {"ptsname", ptsname},
-    // {"ptsname_r", ptsname_r},
-    // {"getpt", getpt},
-    {"getloadavg", getloadavg},
-    /* string.h */
-    {"memccpy",memccpy},
-    {"memchr",memchr},
-    // {"memrchr",memrchr},
-    {"memcmp",memcmp},
-    {"memcpy",my_memcpy},
-    {"memmove",memmove},
-    {"memset",memset},
-    {"memmem",memmem},
-    // {"memswap",memswap},
-    {"strchr",strchr},
-    {"strrchr",strrchr},
-    {"strlen",my_strlen},
-    {"__strlen_chk",my_strlen_chk},
-    {"strcmp",strcmp},
-    {"strcpy",strcpy},
-    {"strcat",strcat},
-    {"strdup",strdup},
-    {"strstr",strstr},
-    {"strtok",strtok},
-    {"strtok_r",strtok_r},
-    {"strerror",strerror},
-    {"strerror_r",strerror_r},
-    {"strnlen",strnlen},
-    {"strncat",strncat},
-    {"strndup",strndup},
-    {"strncmp",strncmp},
-    {"strncpy",strncpy},
-    // {"strlcat",strlcat},
-    {"strlcpy",strlcpy},
-    {"strcspn",strcspn},
-    {"strpbrk",strpbrk},
-    {"strsep",strsep},
-    {"strspn",strspn},
-    {"strsignal",strsignal},
-    {"getgrnam", getgrnam},
-    {"strcoll",strcoll},
-    {"strxfrm",strxfrm},
-    /* wchar.h */
-    {"wcslen",wcslen},
-    /* strings.h */
-    {"bcmp",bcmp},
-    {"bcopy",bcopy},
-    {"bzero",bzero},
-    {"ffs",ffs},
-    {"index",index},
-    {"rindex",rindex},
-    {"strcasecmp",strcasecmp},
-    {"strncasecmp",strncasecmp},
-    /* errno.h */
-#ifdef __APPLE__
-    {"__errno", darwin_my_errno},
-#else
-    {"__errno", __errno_location},
-#endif
-    {"__set_errno", my_set_errno},
-    {"sysconf", my_sysconf},
     {"dlopen", android_dlopen},
     {"dlerror", android_dlerror},
     {"dlsym", my_android_dlsym},
     {"dladdr", android_dladdr},
     {"dlclose", android_dlclose},
-    {"__get_tls_hooks", __get_tls_hooks},
-    {"sscanf", sscanf},
-    {"scanf", scanf},
-    {"vscanf", vscanf},
-    {"vsscanf", vsscanf},
-    {"openlog", openlog},
-    {"syslog", syslog},
-    {"closelog", closelog},
-    {"vsyslog", vsyslog},
-    // {"timer_create", timer_create},
-    // {"timer_settime", timer_settime},
-    // {"timer_gettime", timer_gettime},
-    // {"timer_delete", timer_delete},
-    // {"timer_getoverrun", timer_getoverrun},
-    {"writev", writev},
-    /* unistd.h */
-    {"access", access},
-    {"lseek", lseek},
-    // {"lseek64", lseek64},
-    {"close", close},
-    {"read", read},
-    {"write", write},
+
+    {"syscall", my_syscall},
+
 #ifdef __APPLE__
-    {"pread", darwin_my_pread},
-    {"pwrite", darwin_my_pwrite},
+    {"__errno", darwin_my_errno},
 #else
-    {"pread", pread},
-    {"pwrite", pwrite},
+    {"__errno", __errno_location},
 #endif
-    // {"pread64", pread64},
-    // {"pwrite64", pwrite64},
-    {"pipe", pipe},
-    // {"pipe2", pipe2},
-    {"alarm", alarm},
-    {"sleep", sleep},
-    {"usleep", usleep},
-    {"pause", pause},
-    {"chown", chown},
-    {"fchown", fchown},
-    {"lchown", lchown},
-    {"chdir", chdir},
-    {"fchdir", fchdir},
-    {"getcwd", getcwd},
-    // {"get_current_dir_name", get_current_dir_name},
-    {"dup", dup},
-    {"dup2", dup2},
-    // {"dup3", dup3},
-    // {"execve", execve},
-    {"execv", execv},
-    {"execle", execle},
-    {"execl", execl},
-    {"execvp", execvp},
-    {"execlp", execlp},
-    // {"execvpe", execvpe},
-    {"nice", nice},
+    {"environ", &environ},
+    {"getauxval", my_getauxval},
+    {"execve", execve},
+    {"exit", exit},
     {"_exit", _exit},
-    {"pathconf", pathconf},
-    {"fpathconf", fpathconf},
-    {"confstr", confstr},
+    {"__exit", _exit},
+    {"_Exit", _exit},
+    // {"quick_exit", quick_exit},
+    // {"at_quick_exit", at_quick_exit},
+    {"abort", abort},
+    {"atexit", atexit},
+    {"__cxa_atexit", __cxa_atexit},
+    {"__cxa_finalize", __cxa_finalize},
+    {"raise", raise},
+    {"tgkill", tgkill},
+    {"kill", kill},
+    {"sigaction", my_sigaction},
+    {"sigaction64", my_sigaction64},
+    {"sigsuspend64", my_sig_stub},
+    {"sigtimedwait64", my_sig_stub},
+    {"sigprocmask64", my_sig_stub},
+    {"__brk", brk},
+    {"fork", fork},
+    {"vfork", vfork},
+    {"wait4", wait4},
+    {"waitid", waitid},
+
+#ifdef __APPLE__
+    {"prctl", darwin_my_prctl},
+    {"getrlimit", darwin_my_getrlimit},
+    {"prlimit64", darwin_my_prlimit64},
+#else
+    {"prctl", prctl},
+    {"getrlimit", getrlimit},
+    {"prlimit64", prlimit64},
+#endif
+    {"getrusage", getrusage},
+    {"get_phys_pages", get_phys_pages},
+    {"get_avphys_pages", get_avphys_pages},
+    {"sysinfo", sysinfo},
+
+    {"nanosleep", nanosleep},
     {"getpid", getpid},
     {"getppid", getppid},
     {"getpgrp", getpgrp},
-    // {"__getpgid", __getpgid},
-    // {"getpgid", getpgid},
     {"setpgid", setpgid},
     {"setpgrp", setpgrp},
     {"setsid", setsid},
@@ -616,94 +360,23 @@ struct _hook main_hooks[] = {
     // {"getresgid", getresgid},
     // {"setresuid", setresuid},
     // {"setresgid", setresgid},
-    {"fork", fork},
-    {"vfork", vfork},
-    {"ttyname", ttyname},
-    {"ttyname_r", ttyname_r},
-    {"isatty", isatty},
-    {"ttyslot", ttyslot},
-    {"link", link},
-    {"symlink", symlink},
-    {"readlink", readlink},
-    {"unlink", unlink},
-    {"rmdir", rmdir},
-    {"tcgetpgrp", tcgetpgrp},
-    {"getlogin", getlogin},
-    {"getlogin_r", getlogin_r},
-    {"gethostname", gethostname},
-    {"sethostname", sethostname},
-    {"sethostid", sethostid},
-    {"getdomainname", getdomainname},
-    {"setdomainname", setdomainname},
-    // {"vhangup", vhangup},
-    // {"profil", profil},
-    {"acct", acct},
-    {"getusershell", getusershell},
-    {"endusershell", endusershell},
-    {"setusershell", setusershell},
-    {"daemon", daemon},
-    {"chroot", chroot},
-    {"getpass", getpass},
-    {"fsync", fsync},
-    // {"syncfs", syncfs},
-    {"gethostid", gethostid},
-    {"sync", sync},
+    {"getgrnam", getgrnam},
+    {"uname", uname },
+    {"__getcwd", my_getcwd },
+
+    {"setitimer", setitimer},
+    {"gettimeofday", gettimeofday},
+    {"setlocale", setlocale},
+    {"localeconv", localeconv},
+
+    {"sched_getcpu", sched_getcpu},
+    {"sched_yield", sched_yield},
+    {"sched_getscheduler", sched_getscheduler},
+    {"sched_setparam", sched_setparam},
+    {"get_nprocs", get_nprocs},
+    {"get_nprocs_conf", get_nprocs_conf},
     {"getpagesize", getpagesize},
-    {"getdtablesize", getdtablesize},
-    {"truncate", truncate},
-    // {"truncate64", truncate64},
-    {"ftruncate", ftruncate},
-    // {"ftruncate64", ftruncate64},
-    {"brk", brk},
-    {"sbrk", sbrk},
-    {"syscall", syscall},
-    {"lockf", lockf},
-    // {"lockf64", lockf64},
-#ifdef __APPLE__
-    {"fdatasync", darwin_my_fdatasync},
-#else
-    {"fdatasync", fdatasync},
-#endif
-    {"swab", swab},
-    /* time.h */
-    {"clock", clock},
-    {"time", time},
-    {"difftime", difftime},
-    {"mktime", mktime},
-    {"strftime", strftime},
-    {"strptime", strptime},
-    {"strftime_l", strftime_l},
-    {"strptime_l", strptime_l},
-    {"gmtime", gmtime},
-    {"localtime", localtime},
-    {"gmtime_r", gmtime_r},
-    {"localtime_r", localtime_r},
-    {"asctime", asctime},
-    {"ctime", ctime},
-    {"asctime_r", asctime_r},
-    {"ctime_r", ctime_r},
-    // {"__tzname", __tzname},
-    // {"__daylight", &__daylight},
-    // {"__timezone", &__timezone},
-    {"tzname", tzname},
-    {"tzset", tzset},
-    {"daylight", &daylight},
-    {"timezone", &timezone},
-    // {"stime", stime},
-    {"timegm", timegm},
-    {"timelocal", timelocal},
-    // {"dysize", dysize},
-    {"nanosleep", nanosleep},
-    {"clock_getres", clock_getres},
-#ifdef __APPLE__
-    {"clock_gettime", darwin_my_clock_gettime},
-#else
-    {"clock_gettime", clock_gettime},
-#endif
-    {"clock_settime", clock_settime},
-    // {"clock_nanosleep", clock_nanosleep},
-    // {"clock_getcpuclockid", clock_getcpuclockid},
-    /* mman.h */
+
 #ifdef __APPLE__
     {"mmap", darwin_my_mmap},
 #else
@@ -717,16 +390,136 @@ struct _hook main_hooks[] = {
     {"munlock", munlock},
     {"mlockall", mlockall},
     {"munlockall", munlockall},
-    /* signal.h */
-    // {"__sysv_signal", __sysv_signal},
-    // {"sysv_signal", sysv_signal},
-    {"signal", signal},
-    {"bsd_signal", signal},
-    {"kill", kill},
-    {"killpg", killpg},
-    {"raise", raise},
-    {"sigaction", sigaction},
-    {"sigprocmask", sigprocmask},
+
+    /* time.h */
+    {"time", time},
+    {"difftime", difftime},
+    {"mktime", mktime},
+    {"strftime", strftime},
+    {"strptime", strptime},
+    {"strftime_l", strftime_l},
+    {"strptime_l", strptime_l},
+    {"gmtime", gmtime},
+    {"gmtime_r", gmtime_r},
+    {"localtime", localtime},
+    {"localtime_r", localtime_r},
+    {"asctime", asctime},
+    {"asctime_r", asctime_r},
+    {"ctime", ctime},
+    {"ctime_r", ctime_r},
+    // {"__tzname", __tzname},
+    // {"__daylight", &__daylight},
+    // {"__timezone", &__timezone},
+    {"tzname", tzname},
+    {"tzset", tzset},
+    {"daylight", &daylight},
+    {"timezone", &timezone},
+    // {"stime", stime},
+    {"timegm", timegm},
+    {"timelocal", timelocal},
+    // {"dysize", dysize},
+#ifdef __APPLE__
+    {"clock_getres", darwin_my_clock_getres},
+    {"clock_gettime", darwin_my_clock_gettime},
+#else
+    {"clock_getres", clock_getres},
+    {"clock_gettime", clock_gettime},
+#endif
+    // {"clock_settime", clock_settime},
+    {"clock_nanosleep", clock_nanosleep},
+    // {"clock_getcpuclockid", clock_getcpuclockid},
+
+    {"getentropy", getentropy},
+
+    /* HOST ALLOCATOR BRIDGE */
+    {"malloc", malloc },
+    {"_ZdlPv", _ZdlPv },
+    {"_Znwj", _Znwj },
+    {"calloc", calloc},
+    {"realloc", realloc},
+    {"free", free},
+    {"valloc", valloc},
+    {"memalign", memalign},
+    {"posix_memalign", posix_memalign},
+    /* END OF HOST ALLOCATOR BRIDGE */
+
+    /* OPTIONAL SET OF FUNCTIONS (MAYBE PERFORMANCE IMPROVEMENT?) */
+    /*
+    {"memccpy",memccpy},
+    {"memchr",memchr},
+    {"memcmp",memcmp},
+    {"memcpy",my_memcpy},
+    {"memmove",memmove},
+    {"memset",memset},
+    {"memmem",memmem},
+    // {"memswap",memswap},
+    {"strchr",strchr},
+    {"strrchr",strrchr},
+    {"strlen",my_strlen},
+    {"__strlen_chk",my_strlen_chk},
+    {"strcmp",strcmp},
+    {"strcpy",strcpy},
+    {"strcat",strcat},
+    {"strstr",strstr},
+    {"strtok",strtok},
+    {"strtok_r",strtok_r},
+    {"strnlen",strnlen},
+    {"strncat",strncat},
+    {"strncmp",strncmp},
+    {"strncpy",strncpy},
+    // {"strlcat",strlcat},
+    {"strcspn",strcspn},
+    {"strpbrk",strpbrk},
+    {"strsep",strsep},
+    {"strspn",strspn},
+    {"bcopy",bcopy},
+    {"bzero",bzero},
+    {"index",index},
+    {"strcoll", strcoll},
+    {"strxfrm", strxfrm},
+     */
+    /* END OF OPTIONAL SET */
+
+    /* Start of misc forwarded functions */
+
+    {"strerror", strerror}, //TODO:
+    {"strerror_r", strerror_r},
+
+    {"posix_openpt", posix_openpt},
+    {"grantpt", grantpt},
+    {"unlockpt", unlockpt},
+    {"ptsname", ptsname},
+    // {"ptsname_r", ptsname_r},
+    // {"getpt", getpt},
+    {"getloadavg", getloadavg},
+
+    /* errno.h */
+    // {"timer_create", timer_create},
+    // {"timer_settime", timer_settime},
+    // {"timer_gettime", timer_gettime},
+    // {"timer_delete", timer_delete},
+    // {"timer_getoverrun", timer_getoverrun},
+    /* unistd.h */
+    {"getcwd", getcwd},
+    // {"get_current_dir_name", get_current_dir_name},
+    {"nice", nice},
+    {"confstr", confstr},
+    {"getlogin", getlogin},
+    {"getlogin_r", getlogin_r},
+    {"sethostid", sethostid},
+    // {"vhangup", vhangup},
+    // {"profil", profil},
+    {"acct", acct},
+    {"getusershell", getusershell},
+    {"endusershell", endusershell},
+    {"setusershell", setusershell},
+    {"daemon", daemon},
+    {"chroot", chroot},
+    {"getpass", getpass},
+    // {"syncfs", syncfs},
+    {"gethostid", gethostid},
+    {"getdtablesize", getdtablesize},
+
     /* sys/epoll.h */
     {"epoll_create", epoll_create},
     // {"epoll_create1", epoll_create1},
@@ -734,67 +527,11 @@ struct _hook main_hooks[] = {
     {"epoll_wait", epoll_wait},
     /* grp.h */
     {"getgrgid", getgrgid},
-    {"__cxa_atexit", __cxa_atexit},
-    {"__cxa_finalize", __cxa_finalize},
-    /* arpa/inet.h */
-    {"inet_addr", inet_addr},
-    {"inet_lnaof", inet_lnaof},
-    {"inet_makeaddr", inet_makeaddr},
-    {"inet_netof", inet_netof},
-    {"inet_network", inet_network},
-    {"inet_ntoa", inet_ntoa},
-    {"inet_pton", inet_pton},
-    {"inet_ntop", inet_ntop},
     /* net/if.h */
     {"if_nametoindex", if_nametoindex},
     {"if_indextoname", if_indextoname},
     {"if_nameindex", if_nameindex},
     {"if_freenameindex", if_freenameindex},
-    /* ctype.h */
-    {"isalnum", hybris_isalnum},
-    {"isalpha", hybris_isalpha},
-    {"isblank", hybris_isblank},
-    {"iscntrl", hybris_iscntrl},
-    {"isdigit", hybris_isdigit},
-    {"isgraph", hybris_isgraph},
-    {"islower", hybris_islower},
-    {"isprint", hybris_isprint},
-    {"ispunct", hybris_ispunct},
-    {"isspace", hybris_isspace},
-    {"isupper", hybris_isupper},
-    {"isxdigit", hybris_isxdigit},
-    {"tolower", tolower},
-    {"toupper", toupper},
-    {"_tolower_tab_", &_hybris_tolower_tab_},
-    {"_toupper_tab_", &_hybris_toupper_tab_},
-    {"_ctype_", &_hybris_ctype_},
-    /* wctype.h */
-    {"wctype", wctype},
-    {"iswspace", iswspace},
-    {"iswctype", iswctype},
-    {"towlower", towlower},
-    {"towupper", towupper},
-     /* wchar.h */
-    {"wctob", wctob},
-    {"btowc", btowc},
-    {"wmemchr", wmemchr},
-    {"wmemcmp", wmemcmp},
-    {"wmemcpy", wmemcpy},
-    {"wmemset", wmemset},
-    {"wmemmove", wmemmove},
-    {"wcrtomb", wcrtomb},
-    {"mbrtowc", mbrtowc},
-    {"wcscoll", wcscoll},
-    {"wcsxfrm", wcsxfrm},
-    {"wcsftime", wcsftime},
-    /* sys/prctl.h */
-#ifdef __APPLE__
-    {"prctl", darwin_my_prctl},
-#else
-    {"prctl", prctl},
-#endif
-    /* sys/resource.h */
-    {"getrusage", getrusage},
     {NULL, NULL},
 };
 static struct _hook* user_hooks = NULL;

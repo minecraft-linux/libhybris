@@ -1598,6 +1598,42 @@ static int reloc_library(soinfo *si, Elf32_Rel *rel, unsigned count)
     return 0;
 }
 
+static int reloc_library_ifunc(soinfo *si, Elf32_Rel *rel, unsigned count)
+{
+    Elf32_Sym *symtab = si->symtab;
+    const char *strtab = si->strtab;
+    Elf32_Sym *s;
+    unsigned base;
+    unsigned idx;
+
+    for (idx = 0; idx < count; ++idx, ++rel) {
+        unsigned sym = ELF32_R_SYM(rel->r_info);
+        unsigned sym_addr = 0;
+        char *sym_name = NULL;
+
+        if (sym == 0)
+            continue;
+        sym_name = (char *)(strtab + symtab[sym].st_name);
+        s = _do_lookup(si, sym_name, &base);
+        if (s == NULL)
+            continue;
+
+        sym_addr = (unsigned)(s->st_value + base);
+
+        if (ELF32_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
+            unsigned (*resolver)();
+            resolver = (void *) sym_addr;
+            sym_addr = resolver();
+            s->st_value = sym_addr - base;
+            s->st_info = ELF32_ST_INFO(STB_GLOBAL, STT_GNU_IFUNC + 1);
+            reloc_library(si, rel, 1);
+        } else if (ELF32_ST_TYPE(s->st_info) == STT_GNU_IFUNC + 1) {
+            reloc_library(si, rel, 1);
+        }
+    }
+    return 0;
+}
+
 /* Please read the "Initialization and Termination functions" functions.
  * of the linker design note in bionic/linker/README.TXT to understand
  * what the following code is doing.
@@ -1639,10 +1675,6 @@ void call_constructors_recursive(soinfo *si)
 {
     if (si->constructors_called)
         return;
-    if (strcmp(si->name,"libc.so") == 0) {
-        INFO("HYBRIS: =============> Skipping libc.so\n");
-        return;
-    }
 
     // Set this before actually calling the constructors, otherwise it doesn't
     // protect against recursive constructor calls. One simple example of
@@ -2075,6 +2107,11 @@ static int link_image(soinfo *si, unsigned wr_offset)
                    pid, si->name, errno, strerror(errno));
             goto fail;
         }
+    }
+
+    if(si->plt_rel) {
+        if (reloc_library_ifunc(si, si->plt_rel, si->plt_rel_count))
+            goto fail;
     }
 
     /* If this is a SET?ID program, dup /dev/null to opened stdin,

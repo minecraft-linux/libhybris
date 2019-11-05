@@ -137,8 +137,7 @@ struct _hook net_hooks[] = {
     {"recvmsg", recvmsg},
     // {"recvmmsg", recvmmsg},
     {"listen", listen},
-    {"accept", accept},
-    // {"accept4", accept4},
+    {"accept4", accept4},
     {"shutdown", shutdown},
     {NULL, NULL}
 };
